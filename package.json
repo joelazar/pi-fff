@@ -1,0 +1,38 @@
+{
+  "name": "pi-fff",
+  "version": "0.1.0",
+  "description": "@-prefixed file path autocomplete extension for pi powered by @ff-labs/fff-node",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "extension",
+    "autocomplete",
+    "files",
+    "fff"
+  ],
+  "author": "Shpetim Alimi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShpetimA/pi-fff.git"
+  },
+  "dependencies": {
+    "@ff-labs/fff-node": "^0.5.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
