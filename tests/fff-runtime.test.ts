@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { FileFinder, GrepCursor, GrepMatch, Result, SearchResult, GrepResult } from "@ff-labs/fff-node";
@@ -200,6 +200,23 @@ test("resolvePath prefers project-root exact paths while still allowing explicit
 	assert.equal(cwdFallback.value.relativePath, "packages/app/local.ts");
 });
 
+test("resolvePath expands tilde paths before checking direct filesystem matches", async () => {
+	const root = await mkdtemp(join(homedir(), "pi-fff-home-"));
+	const filePath = join(root, "tilde.ts");
+	await writeFile(filePath, "export const tilde = true;\n", "utf8");
+
+	try {
+		const runtime = new FffRuntime(process.cwd(), { finder: createMockFinder({}) });
+		const resolved = await runtime.resolvePath(`~/${filePath.slice(homedir().length + 1)}`);
+		assert.equal(resolved.isOk(), true);
+		if (resolved.isErr()) assert.fail(resolved.error.message);
+		assert.equal(resolved.value.absolutePath, filePath);
+		assert.equal(resolved.value.pathType, "file");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("resolvePath uses MCP-style best-match heuristic", async () => {
 	const finder = createMockFinder({
 		fileSearch(query): Result<SearchResult> {
@@ -234,10 +251,10 @@ test("resolvePath uses MCP-style best-match heuristic", async () => {
 });
 
 test("grepSearch reuses stored cursor items before touching finder again", async () => {
-	let grepCalls = 0;
+	let multiGrepCalls = 0;
 	const finder = createMockFinder({
-		grep(): Result<GrepResult> {
-			grepCalls += 1;
+		multiGrep(): Result<GrepResult> {
+			multiGrepCalls += 1;
 			return ok({
 				items: [
 					makeMatch("src/a.ts", 1, "needle one"),
@@ -259,22 +276,22 @@ test("grepSearch reuses stored cursor items before touching finder again", async
 	if (first.isErr()) assert.fail(first.error.message);
 	assert.equal(first.value.items.length, 2);
 	assert.ok(first.value.nextCursor);
-	assert.equal(grepCalls, 1);
+	assert.equal(multiGrepCalls, 1);
 
 	const second = await runtime.grepSearch({ pattern: "needle", limit: 2, cursor: first.value.nextCursor, includeCursorHint: true });
 	assert.equal(second.isOk(), true);
 	if (second.isErr()) assert.fail(second.error.message);
 	assert.equal(second.value.items.length, 1);
 	assert.equal(second.value.items[0]?.relativePath, "src/c.ts");
-	assert.equal(grepCalls, 1);
+	assert.equal(multiGrepCalls, 1);
 });
 
 test("grepSearch auto-broadens empty multi-word queries", async () => {
-	const calls: string[] = [];
+	const calls: string[][] = [];
 	const finder = createMockFinder({
-		grep(query): Result<GrepResult> {
-			calls.push(query);
-			if (query === "alpha beta") {
+		multiGrep(options): Result<GrepResult> {
+			calls.push(options.patterns);
+			if (options.patterns[0] === "alpha beta") {
 				return ok({
 					items: [],
 					totalMatched: 0,
@@ -284,7 +301,7 @@ test("grepSearch auto-broadens empty multi-word queries", async () => {
 					nextCursor: null,
 				});
 			}
-			if (query === "beta") {
+			if (options.patterns[0] === "beta") {
 				return ok({
 					items: [makeMatch("src/example.ts", 4, "const beta = true;")],
 					totalMatched: 1,
@@ -294,7 +311,7 @@ test("grepSearch auto-broadens empty multi-word queries", async () => {
 					nextCursor: null,
 				});
 			}
-			throw new Error(`unexpected query: ${query}`);
+			throw new Error(`unexpected query: ${options.patterns[0]}`);
 		},
 	});
 
@@ -302,16 +319,28 @@ test("grepSearch auto-broadens empty multi-word queries", async () => {
 	const result = await runtime.grepSearch({ pattern: "alpha beta", limit: 5 });
 	assert.equal(result.isOk(), true);
 	if (result.isErr()) assert.fail(result.error.message);
-	assert.deepEqual(calls, ["alpha beta", "beta"]);
+	assert.deepEqual(calls, [["alpha beta"], ["beta"]]);
 	assert.match(result.value.formatted, /Auto-broadened to "beta"/);
 	assert.match(result.value.formatted, /src\/example.ts:4: const beta = true;/);
 });
 
 test("grepSearch falls back to fuzzy search when exact search finds nothing", async () => {
-	const calls: Array<{ query: string; mode: string | undefined }> = [];
+	const grepCalls: Array<{ query: string; mode: string | undefined }> = [];
+	const multiCalls: string[][] = [];
 	const finder = createMockFinder({
+		multiGrep(options): Result<GrepResult> {
+			multiCalls.push(options.patterns);
+			return ok({
+				items: [],
+				totalMatched: 0,
+				totalFilesSearched: 1,
+				totalFiles: 2,
+				filteredFileCount: 2,
+				nextCursor: null,
+			});
+		},
 		grep(query, options): Result<GrepResult> {
-			calls.push({ query, mode: options?.mode });
+			grepCalls.push({ query, mode: options?.mode });
 			if (options?.mode === "fuzzy") {
 				return ok({
 					items: [makeMatch("src/example.ts", 8, "const needle = true;")],
@@ -337,10 +366,8 @@ test("grepSearch falls back to fuzzy search when exact search finds nothing", as
 	const result = await runtime.grepSearch({ pattern: "neddle", limit: 5 });
 	assert.equal(result.isOk(), true);
 	if (result.isErr()) assert.fail(result.error.message);
-	assert.deepEqual(calls, [
-		{ query: "neddle", mode: "plain" },
-		{ query: "neddle", mode: "fuzzy" },
-	]);
+	assert.deepEqual(multiCalls, [["neddle"]]);
+	assert.deepEqual(grepCalls, [{ query: "neddle", mode: "fuzzy" }]);
 	assert.match(result.value.formatted, /0 exact matches\. 1 approximate:/);
 	assert.match(result.value.formatted, /src\/example.ts/);
 });
@@ -388,24 +415,12 @@ test("grepSearch suggests a relevant file path when content search is empty", as
 	assert.match(result.value.formatted, /0 content matches\. But there is a relevant file path: src\/components\/button.ts/);
 });
 
-test("multiGrepSearch falls back to single-pattern grep when multi-grep is empty", async () => {
+test("multiGrepSearch falls back to single-pattern searches when multi-grep is empty", async () => {
 	const multiCalls: string[][] = [];
-	const grepCalls: string[] = [];
 	const finder = createMockFinder({
 		multiGrep(options): Result<GrepResult> {
 			multiCalls.push(options.patterns);
-			return ok({
-				items: [],
-				totalMatched: 0,
-				totalFilesSearched: 1,
-				totalFiles: 3,
-				filteredFileCount: 3,
-				nextCursor: null,
-			});
-		},
-		grep(query): Result<GrepResult> {
-			grepCalls.push(query);
-			if (query === "FirstVariant") {
+			if (options.patterns.length === 2) {
 				return ok({
 					items: [],
 					totalMatched: 0,
@@ -415,7 +430,17 @@ test("multiGrepSearch falls back to single-pattern grep when multi-grep is empty
 					nextCursor: null,
 				});
 			}
-			if (query === "second_variant") {
+			if (options.patterns[0] === "FirstVariant") {
+				return ok({
+					items: [],
+					totalMatched: 0,
+					totalFilesSearched: 1,
+					totalFiles: 3,
+					filteredFileCount: 3,
+					nextCursor: null,
+				});
+			}
+			if (options.patterns[0] === "second_variant") {
 				return ok({
 					items: [makeMatch("src/example.ts", 7, "const second_variant = true;")],
 					totalMatched: 1,
@@ -425,7 +450,7 @@ test("multiGrepSearch falls back to single-pattern grep when multi-grep is empty
 					nextCursor: null,
 				});
 			}
-			throw new Error(`unexpected query: ${query}`);
+			throw new Error(`unexpected patterns: ${options.patterns.join(",")}`);
 		},
 	});
 
@@ -433,27 +458,17 @@ test("multiGrepSearch falls back to single-pattern grep when multi-grep is empty
 	const result = await runtime.multiGrepSearch({ patterns: ["FirstVariant", "second_variant"], limit: 5 });
 	assert.equal(result.isOk(), true);
 	if (result.isErr()) assert.fail(result.error.message);
-	assert.deepEqual(multiCalls, [["FirstVariant", "second_variant"]]);
-	assert.deepEqual(grepCalls, ["FirstVariant", "second_variant"]);
+	assert.deepEqual(multiCalls, [["FirstVariant", "second_variant"], ["FirstVariant"], ["second_variant"]]);
 	assert.match(result.value.formatted, /0 multi-pattern matches\. Plain grep fallback for "second_variant":/);
 	assert.match(result.value.formatted, /src\/example.ts:7: const second_variant = true;/);
 });
 
 test("grepSearch uses multi-grep engine for slash/brace literal patterns", async () => {
-	let grepCalls = 0;
 	let multiCalls = 0;
 	const pattern = "/repos/{owner}/{repo}/pulls/{pull_number}/files";
 	const finder = createMockFinder({
 		grep(): Result<GrepResult> {
-			grepCalls += 1;
-			return ok({
-				items: [],
-				totalMatched: 0,
-				totalFilesSearched: 1,
-				totalFiles: 1,
-				filteredFileCount: 1,
-				nextCursor: null,
-			});
+			throw new Error("plain search should use multiGrep");
 		},
 		multiGrep(options): Result<GrepResult> {
 			multiCalls += 1;
@@ -474,43 +489,95 @@ test("grepSearch uses multi-grep engine for slash/brace literal patterns", async
 	assert.equal(result.isOk(), true);
 	if (result.isErr()) assert.fail(result.error.message);
 	assert.equal(multiCalls, 1);
-	assert.equal(grepCalls, 0);
 	assert.equal(result.value.items.length, 1);
 	assert.equal(result.value.items[0]?.relativePath, "spec.yaml");
 });
 
-test("grepSearch keeps pattern query plain and applies scope/glob as post-filters", async () => {
+test("grepSearch splits pipe-separated literal alternates into multi-grep patterns", async () => {
+	const calls: string[][] = [];
+	const finder = createMockFinder({
+		multiGrep(options): Result<GrepResult> {
+			calls.push(options.patterns);
+			assert.deepEqual(options.patterns, ["export function DiffWorkspace", "const DiffWorkspace"]);
+			return ok({
+				items: [makeMatch("src/DiffWorkspace.tsx", 10, "export function DiffWorkspace() {")],
+				totalMatched: 1,
+				totalFilesSearched: 1,
+				totalFiles: 1,
+				filteredFileCount: 1,
+				nextCursor: null,
+			});
+		},
+	});
+
+	const runtime = new FffRuntime(process.cwd(), { finder });
+	const result = await runtime.grepSearch({ pattern: "export function DiffWorkspace|const DiffWorkspace", limit: 5 });
+	assert.equal(result.isOk(), true);
+	if (result.isErr()) assert.fail(result.error.message);
+	assert.deepEqual(calls, [["export function DiffWorkspace", "const DiffWorkspace"]]);
+	assert.equal(result.value.items[0]?.relativePath, "src/DiffWorkspace.tsx");
+});
+
+test("grepSearch pushes scope and brace globs into native constraints for plain searches", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-fff-"));
 	await mkdir(join(root, "src"), { recursive: true });
 	await writeFile(join(root, "src", "example.ts"), "export const needle = true;\n", "utf8");
 
-	const calls: Array<{ query: string; cursor: GrepCursor | null | undefined }> = [];
+	const calls: Array<{ patterns: string[]; constraints: string | undefined; cursor: GrepCursor | null | undefined }> = [];
 	const finder = createMockFinder({
-		grep(query, options): Result<GrepResult> {
-			calls.push({ query, cursor: options?.cursor });
+		grep(): Result<GrepResult> {
+			throw new Error("plain search should use multiGrep");
+		},
+		multiGrep(options): Result<GrepResult> {
+			calls.push({ patterns: options.patterns, constraints: options.constraints, cursor: options.cursor });
 			return ok({
-				items: [
-					makeMatch("src/example.ts", 1, "export const needle = true;"),
-					makeMatch("src/example.js", 2, "const needle = true;"),
-					makeMatch("other/ignore.ts", 3, "export const needle = true;"),
-				],
-				totalMatched: 3,
-				totalFilesSearched: 3,
-				totalFiles: 3,
-				filteredFileCount: 3,
+				items: [makeMatch("src/example.ts", 1, "export const needle = true;")],
+				totalMatched: 1,
+				totalFilesSearched: 1,
+				totalFiles: 1,
+				filteredFileCount: 1,
 				nextCursor: null,
 			});
 		},
 	});
 
 	const runtime = new FffRuntime(root, { finder });
-	const result = await runtime.grepSearch({ pattern: "needle", pathQuery: "src", glob: "**/*.ts", limit: 5 });
+	const result = await runtime.grepSearch({ pattern: "needle", pathQuery: "src", glob: "*.{ts,tsx}", limit: 5 });
 	assert.equal(result.isOk(), true);
 	if (result.isErr()) assert.fail(result.error.message);
 	assert.equal(calls.length, 1);
-	assert.equal(calls[0]?.query, "needle");
-	assert.equal(result.value.constraintQuery, undefined);
+	assert.deepEqual(calls[0]?.patterns, ["needle"]);
+	assert.equal(calls[0]?.constraints, "/src/ *.{ts,tsx}");
+	assert.equal(result.value.constraintQuery, "/src/ *.{ts,tsx}");
 	assert.equal(result.value.scope?.relativePath, "src");
 	assert.equal(result.value.items.length, 1);
 	assert.equal(result.value.items[0]?.relativePath, "src/example.ts");
+});
+
+
+test("grepSearch treats dot scope as project root", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-fff-"));
+	await mkdir(join(root, "b"), { recursive: true });
+	await writeFile(join(root, "b", "c"), "abc\n", "utf8");
+
+	const finder = createMockFinder({
+		multiGrep(): Result<GrepResult> {
+			return ok({
+				items: [makeMatch("b/c", 1, "abc")],
+				totalMatched: 1,
+				totalFilesSearched: 1,
+				totalFiles: 1,
+				filteredFileCount: 1,
+				nextCursor: null,
+			});
+		},
+	});
+
+	const runtime = new FffRuntime(root, { finder });
+	const result = await runtime.grepSearch({ pattern: "abc", pathQuery: ".", limit: 5 });
+	assert.equal(result.isOk(), true);
+	if (result.isErr()) assert.fail(result.error.message);
+	assert.equal(result.value.scope?.relativePath, ".");
+	assert.equal(result.value.items.length, 1);
+	assert.equal(result.value.items[0]?.relativePath, "b/c");
 });

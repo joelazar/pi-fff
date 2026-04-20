@@ -2,6 +2,7 @@ import { FileFinder } from "@ff-labs/fff-node";
 import { Result } from "better-result";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { mkdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
 	AmbiguousPathError,
@@ -78,10 +79,16 @@ function stripQuotes(value: string): string {
 	return value;
 }
 
+function expandHome(value: string): string {
+	if (value === "~") return homedir();
+	if (value.startsWith("~/")) return resolve(homedir(), value.slice(2));
+	return value;
+}
+
 function normalizePathQuery(value: string): string {
 	let normalized = value.trim();
 	if (normalized.startsWith("@")) normalized = normalized.slice(1);
-	return normalizeSlashes(stripQuotes(normalized.trim()));
+	return normalizeSlashes(expandHome(stripQuotes(normalized.trim())));
 }
 
 function relativeFrom(basePath: string, targetPath: string): string {
@@ -138,47 +145,22 @@ function isStrongPathCandidate(candidate: FffFileCandidate | undefined, query: s
 	return candidate.score.baseScore > query.length * 10;
 }
 
-function globToRegExp(glob: string): RegExp | null {
+function nativeConstraintForScope(scope: ResolvedPath | undefined): string | undefined {
+	if (!scope) return undefined;
+	const relativePath = normalizeSlashes(scope.relativePath).replace(/^\.\//, "").replace(/\/+$/, "");
+	if (!relativePath || relativePath === ".") return undefined;
+	return scope.pathType === "directory" ? `/${relativePath}/` : relativePath;
+}
+
+function nativeConstraintForGlob(glob: string | undefined): string | undefined {
+	if (!glob) return undefined;
 	const normalized = normalizeSlashes(glob.trim());
-	if (!normalized) return null;
-	let pattern = "^";
-	for (let i = 0; i < normalized.length; i += 1) {
-		const char = normalized[i] ?? "";
-		const next = normalized[i + 1] ?? "";
-		if (char === "*" && next === "*") {
-			pattern += ".*";
-			i += 1;
-			continue;
-		}
-		if (char === "*") {
-			pattern += "[^/]*";
-			continue;
-		}
-		if (char === "?") {
-			pattern += "[^/]";
-			continue;
-		}
-		pattern += /[\\^$+?.()|{}\[\]]/.test(char) ? `\\${char}` : char;
-	}
-	pattern += "$";
-	try {
-		return new RegExp(pattern);
-	} catch {
-		return null;
-	}
+	return normalized || undefined;
 }
 
-function matchesScope(match: GrepMatch, scope: ResolvedPath | undefined): boolean {
-	if (!scope) return true;
-	const matchPath = normalizeSlashes(match.relativePath);
-	const scopePath = normalizeSlashes(scope.relativePath).replace(/\/$/, "");
-	if (scope.pathType === "file") return matchPath === scopePath;
-	return matchPath === scopePath || matchPath.startsWith(`${scopePath}/`);
-}
-
-function matchesGlob(match: GrepMatch, globRegex: RegExp | null): boolean {
-	if (!globRegex) return true;
-	return globRegex.test(normalizeSlashes(match.relativePath));
+function combineConstraints(...parts: Array<string | undefined>): string | undefined {
+	const combined = parts.map((part) => part?.trim()).filter((part): part is string => Boolean(part));
+	return combined.length > 0 ? combined.join(" ") : undefined;
 }
 
 function encodeJsonCursor(prefix: string, payload: unknown): string {
@@ -207,8 +189,12 @@ function buildSingleGrepQuery(pattern: string, constraintQuery: string | undefin
 	return constraintQuery ? `${constraintQuery} ${pattern}` : pattern;
 }
 
-function shouldUseMultiForSinglePlainPattern(pattern: string): boolean {
-	return /[/{}/]/.test(pattern);
+function literalAlternatePatterns(pattern: string): string[] | null {
+	if (!pattern.includes("|")) return null;
+	if (pattern.includes("||") || pattern.includes("\\|")) return null;
+	const parts = pattern.split("|").map((part) => part.trim()).filter((part) => part.length > 0);
+	if (parts.length < 2 || parts.length > 8) return null;
+	return parts;
 }
 
 function grepRequestKey(request: SingleGrepRequest | MultiGrepRequest, constraintQuery: string | undefined): string {
@@ -218,6 +204,7 @@ function grepRequestKey(request: SingleGrepRequest | MultiGrepRequest, constrain
 		patterns: request.kind === "multi" ? request.patterns : undefined,
 		mode: request.kind === "single" ? request.mode : undefined,
 		constraintQuery: constraintQuery ?? null,
+		limit: request.limit,
 		context: request.context,
 		includeCursorHint: request.includeCursorHint ?? false,
 		outputMode: request.outputMode ?? "content",
@@ -537,17 +524,6 @@ export class FffRuntime {
 		return this.grepContinuations.get(cursor) ?? null;
 	}
 
-	private filterMatches(items: GrepMatch[], scope: ResolvedPath | undefined, globRegex: RegExp | null, limit: number): GrepMatch[] {
-		const filtered: GrepMatch[] = [];
-		for (const item of items) {
-			if (!matchesScope(item, scope)) continue;
-			if (!matchesGlob(item, globRegex)) continue;
-			filtered.push(item);
-			if (filtered.length >= limit) break;
-		}
-		return filtered;
-	}
-
 	private buildApproximateMatchText(items: GrepMatch[]): string {
 		const lines = [`0 exact matches. ${items.length} approximate:`];
 		let currentFile = "";
@@ -563,10 +539,11 @@ export class FffRuntime {
 
 	private runFinderGrep(finder: FileFinder, request: SingleGrepRequest | MultiGrepRequest, constraintQuery: string | undefined, engineCursor: GrepCursor | null): AppResult<GrepResult, FinderOperationError> {
 		if (request.kind === "single") {
-			if (request.mode === "plain" && shouldUseMultiForSinglePlainPattern(request.pattern)) {
+			if (request.mode === "plain") {
+				const alternatePatterns = literalAlternatePatterns(request.pattern);
 				return safeFinderCall("multiGrep", () =>
 					finder.multiGrep({
-						patterns: [request.pattern],
+						patterns: alternatePatterns ?? [request.pattern],
 						constraints: constraintQuery,
 						cursor: engineCursor,
 						beforeContext: request.context,
@@ -602,14 +579,12 @@ export class FffRuntime {
 		request: SingleGrepRequest,
 		constraintQuery: string | undefined,
 		resolvedScope: ResolvedPath | undefined,
-		postFilterScope: ResolvedPath | undefined,
-		postFilterGlob: RegExp | null,
 	): Promise<GrepSearchResponse | null> {
 		const broadened = broadenGrepPattern(request.pattern);
 		if (broadened) {
 			const broadenedResult = this.runFinderGrep(finder, { ...request, pattern: broadened }, constraintQuery, null);
 			if (broadenedResult.isErr()) return null;
-			const broadenedItems = this.filterMatches(broadenedResult.value.items, postFilterScope, postFilterGlob, request.limit);
+			const broadenedItems = broadenedResult.value.items.slice(0, request.limit);
 			if (broadenedItems.length > 0) {
 				const built = buildGrepText(broadenedItems, {
 					limit: request.limit,
@@ -637,7 +612,7 @@ export class FffRuntime {
 			if (fuzzyPattern) {
 				const fuzzyResult = this.runFinderGrep(finder, { ...request, pattern: fuzzyPattern, mode: "fuzzy" }, constraintQuery, null);
 				if (fuzzyResult.isOk()) {
-					const fuzzyItems = this.filterMatches(fuzzyResult.value.items, postFilterScope, postFilterGlob, request.limit);
+					const fuzzyItems = fuzzyResult.value.items.slice(0, request.limit);
 					if (fuzzyItems.length > 0) {
 						return {
 							items: fuzzyItems,
@@ -673,8 +648,6 @@ export class FffRuntime {
 		request: MultiGrepRequest,
 		constraintQuery: string | undefined,
 		resolvedScope: ResolvedPath | undefined,
-		postFilterScope: ResolvedPath | undefined,
-		postFilterGlob: RegExp | null,
 	): Promise<GrepSearchResponse | null> {
 		for (const pattern of request.patterns) {
 			const fallbackResult = this.runFinderGrep(finder, {
@@ -691,7 +664,7 @@ export class FffRuntime {
 				outputMode: request.outputMode,
 			}, constraintQuery, null);
 			if (fallbackResult.isErr()) continue;
-			const fallbackItems = this.filterMatches(fallbackResult.value.items, postFilterScope, postFilterGlob, request.limit);
+			const fallbackItems = fallbackResult.value.items.slice(0, request.limit);
 			if (fallbackItems.length === 0) continue;
 			const built = buildGrepText(fallbackItems, {
 				limit: request.limit,
@@ -737,9 +710,11 @@ export class FffRuntime {
 		}
 
 		const resolvedScope = scopeResult && scopeResult.isOk() ? scopeResult.value : undefined;
-		const constraintQuery = request.constraints?.trim() ? request.constraints.trim() : undefined;
-		const postFilterScope = resolvedScope;
-		const postFilterGlob = request.glob ? globToRegExp(request.glob) : null;
+		const constraintQuery = combineConstraints(
+			nativeConstraintForScope(resolvedScope),
+			nativeConstraintForGlob(request.glob),
+			request.constraints?.trim() ? request.constraints.trim() : undefined,
+		);
 		const requestKey = grepRequestKey(request, constraintQuery);
 
 		const continuation = this.getGrepContinuation(request.cursor);
@@ -759,8 +734,6 @@ export class FffRuntime {
 			while (remainingItems.length > 0 && items.length < request.limit) {
 				const item = remainingItems.shift();
 				if (!item) continue;
-				if (!matchesScope(item, postFilterScope)) continue;
-				if (!matchesGlob(item, postFilterGlob)) continue;
 				items.push(item);
 			}
 		};
@@ -782,10 +755,10 @@ export class FffRuntime {
 
 		if (items.length === 0 && !request.cursor) {
 			if (request.kind === "single") {
-				const fallback = await this.buildNoMatchFallback(finder, request, constraintQuery, resolvedScope, postFilterScope, postFilterGlob);
+				const fallback = await this.buildNoMatchFallback(finder, request, constraintQuery, resolvedScope);
 				if (fallback) return Result.ok(fallback);
 			} else {
-				const fallback = await this.buildMultiNoMatchFallback(finder, request, constraintQuery, resolvedScope, postFilterScope, postFilterGlob);
+				const fallback = await this.buildMultiNoMatchFallback(finder, request, constraintQuery, resolvedScope);
 				if (fallback) return Result.ok(fallback);
 			}
 		}
