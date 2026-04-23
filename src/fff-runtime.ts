@@ -241,6 +241,10 @@ export class FffRuntime {
 		if (options.finder) this.finder = options.finder;
 	}
 
+	getProjectRoot(): string {
+		return this.basePath;
+	}
+
 	async ensure(): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
 		if (this.finder) return Result.ok(this.finder);
 		if (this.loadError) return errResult(this.loadError);
